@@ -1,0 +1,39 @@
+
+name: Dipper XNU Cloud Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Check disk and environment
+        run: |
+          uname -a
+          df -h /
+          python3 --version
+          clang --version || true
+
+      - name: Verify source checksums
+        run: |
+          sha256sum -c SHA256SUMS
+
+      - name: Check Python syntax
+        run: |
+          python3 -m compileall -q tools
+
+      - name: Check shell syntax
+        run: |
+          find . -type f -name '*.sh' \
+            -not -path './.git/*' \
+            -print0 | xargs -0 -r -n1 bash -n
+
+      - name: Finish
+        run: echo "Preflight completed"
