@@ -37,3 +37,24 @@ jobs:
 
       - name: Finish
         run: echo "Preflight completed"
+
+      - name: Inspect build scripts
+        run: |
+          echo "=== Build scripts ==="
+          find . -maxdepth 5 -type f \
+            \( -name 'build*.sh' \
+            -o -name 'build*.py' \
+            -o -name 'Makefile' \) \
+            -not -path './.git/*' | sort
+
+          echo "=== Dependency manifests ==="
+          find . -maxdepth 4 -type f \
+            \( -name 'requirements.txt' \
+            -o -name 'Cargo.toml' \
+            -o -name 'Dockerfile' \
+            -o -name 'INPUTS.md' \
+            -o -name 'BUILD.md' \) \
+            -not -path './.git/*' | sort
+
+          echo "=== Repository size ==="
+          du -sh .
