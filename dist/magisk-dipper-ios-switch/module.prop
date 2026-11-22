@@ -1,0 +1,6 @@
+id=dipper-ios-switch
+name=Dipper iOS 启动开关
+version=v1.0
+versionCode=1
+author=yanei
+description=点击模块「操作」按钮写入一次性标志，重启后直接进入 iOS；iOS 里重启即自动回到 Android。首次使用需先部署 flashboot.apfs（见 ios-flag.sh status）。

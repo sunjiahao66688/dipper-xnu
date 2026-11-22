@@ -1,0 +1,766 @@
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 640b05d..042d3ad 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -35,6 +35,20 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
+ #define PAGE_SIZE_MAX       0x4000ULL
+ 
+ #define LOG_PARTITION       u"logdump"
++/*
++ * Dual-boot selection without a menu: one 4096-byte flag block and the iOS
++ * root image live in darwin's unused blocks. The APFS image is built to span
++ * only the first 2042368 blocks, so everything from block 5000000 on is free
++ * and is never written by the kernel (its writes are limited to the two
++ * /private/var slots below block 4194304).
++ */
++#define FLAG_PARTITION      u"darwin"
++#define FLAG_LBA            5000000ULL            /* the flag block */
++#define FLASHBOOT_LBA       5001024ULL            /* flashboot.apfs, size in the flag */
++#define FLAG_MAGIC          0x31464E58u           /* "XNF1" */
++#define FLAG_STATE_IOS      1u
++#define ANDROID_FLAG_ADDR   0x17FE00000ULL        /* read by BootShim.Dualboot.S */
++#define ANDROID_FLAG_VALUE  0x5241u
+ #define CHECKPOINT_SELFTEST 999
+ #define PANIC_LOG_SIZE      0x80000u
+ #define NVRAM_BANK_SIZE     0x2000u
+@@ -254,6 +268,9 @@ clean_dcache(uint64_t start, uint64_t end)
+ /* ------------------------------------------------------------------------ */
+ /* Log persistence: raw write to a GPT partition (phone only)               */
+ 
++/* set from the platform once it is known; the log then stays in memory and on the screen */
++static int log_write_disabled;
++
+ static efi_block_io *
+ find_log_partition(void)
+ {
+@@ -263,6 +280,9 @@ find_log_partition(void)
+ 	efi_handle *handles;
+ 	uint64_t count;
+ 
++	if (log_write_disabled) {
++		return NULL;
++	}
+ 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+ 		return NULL;
+ 	}
+@@ -287,6 +307,42 @@ find_log_partition(void)
+ 	return NULL;
+ }
+ 
++/* Same lookup without the log switch: the dual-boot flag must always be read. */
++static efi_block_io *
++find_named_partition(const char16 *want)
++{
++	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
++	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
++	efi_handle *handles;
++	uint64_t count;
++
++	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
++		return NULL;
++	}
++	for (uint64_t i = 0; i < count; i++) {
++		efi_partition_info *info;
++		efi_block_io *bio;
++		int match = 1;
++
++		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
++			continue;
++		}
++		for (unsigned k = 0; k < 16; k++) {
++			if (info->name[k] != want[k]) {
++				match = 0;
++				break;
++			}
++			if (want[k] == 0) {
++				break;
++			}
++		}
++		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
++			return bio;
++		}
++	}
++	return NULL;
++}
++
+ /*
+  * The "staged" buffer holds the loader log followed by the kernel log of the
+  * last run. It is what gets written to the log partition and what the host
+@@ -296,6 +352,101 @@ static char out_buf[2 * 1024 * 1024];
+ /* the storage's reads for the kernel land here (block_poll); also where the log is read back */
+ #define BLOCK_BUFFER_SIZE  (4u << 20)
+ static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
++
++/* ------------------------------------------------------------------------ */
++/* Dual-boot selection: one flag block, then either this kernel or Android  */
++
++struct boot_flag {
++	uint32_t magic;      /* FLAG_MAGIC when the block has been provisioned */
++	uint32_t state;      /* FLAG_STATE_IOS: boot iOS once, then fall back to Android */
++	uint32_t fb_bytes;   /* size of flashboot.apfs at FLASHBOOT_LBA */
++	uint32_t reserved;
++};
++
++static int
++boot_flag_read(struct boot_flag *f)
++{
++	efi_block_io *bio = find_named_partition(FLAG_PARTITION);
++
++	if (bio == NULL || bio->media->block_size != 4096) {
++		return 0;
++	}
++	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, FLAG_LBA, 1, block_buffer))) {
++		return 0;
++	}
++	memcpy(f, block_buffer, sizeof(*f));
++	return f->magic == FLAG_MAGIC;
++}
++
++static void
++boot_flag_write_state(uint32_t state)
++{
++	efi_block_io *bio = find_named_partition(FLAG_PARTITION);
++	struct boot_flag *f = (struct boot_flag *)block_buffer;
++
++	if (bio == NULL || bio->media->block_size != 4096) {
++		return;
++	}
++	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, FLAG_LBA, 1, block_buffer))) {
++		return;
++	}
++	f->state = state;
++	clean_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + 4096);
++	if (!EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, FLAG_LBA, 1, block_buffer))) {
++		bio->flush_blocks(bio);
++	}
++}
++
++/* The image BootShim hands off to: the flag at 0x17FE00000 plus a warm reset. */
++static void
++android_handoff(void)
++{
++	volatile uint16_t *p = (volatile uint16_t *)(uintptr_t)ANDROID_FLAG_ADDR;
++
++	for (int i = 0; i < 128; i++) {
++		p[i] = ANDROID_FLAG_VALUE;
++	}
++	clean_dcache(ANDROID_FLAG_ADDR, ANDROID_FLAG_ADDR + 256);
++	print("dualboot: Android\n");
++	ST->rt->reset_system(1 /* EfiResetWarm */, 0, 0, NULL);
++	for (;;) {
++	}
++}
++
++static int
++flashboot_ok(const struct boot_flag *f)
++{
++	efi_block_io *bio = find_named_partition(FLAG_PARTITION);
++
++	if (bio == NULL || f->fb_bytes == 0 || (f->fb_bytes & 4095) != 0 || f->fb_bytes > BLOCK_BUFFER_SIZE) {
++		return 0;
++	}
++	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, FLASHBOOT_LBA, 1, block_buffer))) {
++		return 0;
++	}
++	return memcmp(block_buffer + 32, "NXSB", 4) == 0;
++}
++
++/* Copy flashboot.apfs into the resident slot the kernel takes as its root. */
++static uint64_t
++load_flashboot(uint8_t *dest, uint64_t limit)
++{
++	struct boot_flag f;
++	efi_block_io *bio;
++	uint64_t count;
++
++	if (!boot_flag_read(&f) || !flashboot_ok(&f) || f.fb_bytes > limit) {
++		return 0;
++	}
++	bio = find_named_partition(FLAG_PARTITION);
++	count = f.fb_bytes / 4096;
++	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, FLASHBOOT_LBA, count, block_buffer))) {
++		return 0;
++	}
++	memcpy(dest, block_buffer, f.fb_bytes);
++	return f.fb_bytes;
++}
++
+ static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
+ static uint64_t staged_len;
+ 
+@@ -336,9 +487,54 @@ write_logs(const char *klog, uint64_t klog_len)
+ 	if (bio == NULL) {
+ 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
+ 		if (klog != NULL) {
++			/*
++			 * A phone that cannot keep the log (log_write_disabled): the screen is all there is. The
++			 * kernel's own panic screen is still on the framebuffer in another geometry and the log
++			 * would be printed over it (EXP-0029), so start from a clean console.
++			 */
++			if (log_write_disabled && ST->con_out != NULL && ST->con_out->clear_screen != NULL) {
++				ST->con_out->clear_screen(ST->con_out);
++				print("kernel returned; its log follows, the end of it (the panic) is at the bottom\n");
++			}
+ 			print("\n== KERNEL LOG ==\n");
+-			for (uint64_t i = 0; i < klog_len; i++) {
+-				put_char(klog[i]);
++			if (log_write_disabled) {
++				/*
++				 * The panic log ends with the stackshot, which is binary: drawn as text it filled the
++				 * screen and pushed the panic message off it (EXP-0030). A line that is mostly not
++				 * printable is left out, with one note for each run of them.
++				 */
++				uint64_t i = 0, left_out = 0;
++
++				while (i < klog_len) {
++					uint64_t j = i, bad = 0;
++
++					while (j < klog_len && klog[j] != '\n') {
++						unsigned char c = (unsigned char)klog[j];
++						bad += ((c < 0x20 && c != '\t' && c != '\r') || c > 0x7e);
++						j++;
++					}
++					if (j > i && bad * 8 > j - i) {
++						left_out += j - i + 1;
++					} else {
++						if (left_out != 0) {
++							print("[%d bytes of binary data left out]\n", left_out);
++							left_out = 0;
++						}
++						for (uint64_t k = i; k < j; k++) {
++							unsigned char c = (unsigned char)klog[k];
++							put_char((c < 0x20 && c != '\t' && c != '\r') || c > 0x7e ? '?' : (char)c);
++						}
++						put_char('\n');
++					}
++					i = j + 1;
++				}
++				if (left_out != 0) {
++					print("[%d bytes of binary data left out]\n", left_out);
++				}
++			} else {
++				for (uint64_t i = 0; i < klog_len; i++) {
++					put_char(klog[i]);
++				}
+ 			}
+ 			print("\n== END OF LOG ==\n");
+ 		}
+@@ -525,6 +721,9 @@ struct platform {
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+ 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
++	int no_log_write;                /* never write the log to a partition (the stock one called logdump holds Android's) */
++	uint32_t midr_part[2];           /* Qualcomm (0x51) core part numbers: a second way to tell this device apart, 0: unused */
++	uint32_t vtimer_intid;           /* the PPI of the EL1 virtual timer if it is not the kernel's default 27 (boot-arg vtimer_intid=) */
+ };
+ 
+ static const struct platform platform_qemu_virt = {
+@@ -553,6 +752,25 @@ static const struct platform platform_redwood = {
+ 	.fb_base = 0xE1000000,
+ };
+ 
++static const struct platform platform_dipper = {
++	/* Xiaomi Mi 8 (SDM845). GIC, MPIDR and SMC-PSCI from the stock device tree (F-007, EXP-0001). */
++	.name = "dipper", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	/* no log partition here, and "N s: the kernel has logged 0 bytes" lines every 2 s only cover the kernel's screen */
++	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 0,
++	.cores = 8, .core_shift = 8,
++	/* Kryo 385: cores 0-3 Silver (part 0x803, A55 class), 4-7 Gold (part 0x802, A75 class). */
++	.small_cores = 0x0f,
++	/*
++	 * sdm845.dsc PcdMipiFrameBufferAddress; not yet seen in the loader's "display ... at" line [unverified].
++	 * Without a match the loader would poke QEMU's fw_cfg at 0x09020000, which is not safe on a phone, so the
++	 * Kryo MIDR (0x51 / part 0x802 or 0x803) matches this platform as well.
++	 */
++	.fb_base = 0x9D400000,
++	.midr_part = { 0x802, 0x803 },
++	.vtimer_intid = 19,      /* measured on core 0, EXP-0028 / F-017; the kernel's default is 27 */
++	.no_log_write = 1,       /* Mi 8 has a stock partition named logdump: the log would overwrite its first blocks */
++};
++
+ /*
+  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
+  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
+@@ -560,6 +778,7 @@ static const struct platform platform_redwood = {
+  */
+ static const struct platform *const platforms[] = {
+ 	&platform_redwood,
++	&platform_dipper,
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -1489,10 +1708,11 @@ ufs_survey(void)
+  * same partition, named the same, of the same size, in the same place, on logical unit 0.
+  */
+ #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
+-#define BLOCK_DARWIN_LAST  30617594ULL
++/* Mi 8 (dipper): darwin is #22 of LUN 0, 24 GiB, made in EXP-0037 (upstream's phone: 25374720..30617594, uniq FD6854AD-...) */
++#define BLOCK_DARWIN_FIRST 23746560ULL                 /* its first and last LBA of unit 0, as the GPT has them */
++#define BLOCK_DARWIN_LAST  30038013ULL
+ #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
+-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
++#define BLOCK_DARWIN_UNIQ  { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } } /* public export: device GUID removed */
+ 
+ /*
+  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
+@@ -2503,6 +2723,8 @@ struct payload_info {
+ 	uint64_t forced_base;
+ 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+ 	int usb_mode;
++	int timer_probe;                /* "timerprobe" entry: only report which PPI the virtual timer raises, run no kernel */
++	int id_probe;                   /* "idprobe" entry: start each core in turn, read its ID registers, switch it off again (EXP-0043) */
+ };
+ 
+ static uint64_t
+@@ -2555,6 +2777,10 @@ parse_payload(struct payload_info *pi, int verbose)
+ 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
+ 		} else if (str_eq(e->name, "usb")) {
+ 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
++		} else if (str_eq(e->name, "timerprobe")) {
++			pi->timer_probe = 1;
++		} else if (str_eq(e->name, "idprobe")) {
++			pi->id_probe = 1;
+ 		}
+ 		p += sizeof(*e) + ((e->size + 15) & ~15u);
+ 	}
+@@ -2731,6 +2957,21 @@ choose_window(const struct payload_info *pi)
+  */
+ static int starts_with(const char *s, const char *prefix);
+ 
++/* Mirror only loader-owned setup for dipper's kernel peripheral defaults.
++ * An explicit token, including zero, replaces the fallback. Keep the existing
++ * OR behavior for repeated explicit tokens and other diagnostic values. */
++static int loader_peripheral_requested(const char *args,const char *key,int fallback,int exact_one)
++{
++ int found=0,enabled=0;unsigned n=0;while(key[n])n++;
++ for(const char *c=args;*c;c++){
++  if((c==args || c[-1]==' ') && starts_with(c,key) && c[n]=='='){
++   found=1;const char *v=c+n+1;
++   enabled|=exact_one?(v[0]=='1' && (!v[1] || v[1]==' ')):(v[0]>='1' && v[0]<='9');
++  }
++ }
++ return found?enabled:fallback;
++}
++
+ static int
+ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ {
+@@ -2795,6 +3036,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	if (pi.resident_rd != 0) {
+ 		resident_rd_size = pi.resident_rd;
+ 	}
++	/* Nothing staged over USB: the root image comes from the flashboot slot in darwin. */
++	if (resident_rd_size == 0) {
++		uint64_t n = load_flashboot((uint8_t *)(uintptr_t)(phys_base + RESIDENT_RD_OFFSET),
++		    win_size - RESIDENT_RD_OFFSET);
++
++		if (n != 0) {
++			resident_rd_size = n;
++			print("flashboot from darwin: %x bytes at %x\n", n, phys_base + RESIDENT_RD_OFFSET);
++		}
++	}
+ 	if (resident_rd_size != 0) {
+ 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
+ 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+@@ -2848,9 +3099,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
+ 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
+ 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
+-	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
++	int more_cores = 0, ufs_requested = 0;
++ int battery_requested=loader_peripheral_requested(pi.cmdline,"battery",PLAT==&platform_dipper,1);
+ 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
+-	int torch_requested = 0;
++	int torch_requested=loader_peripheral_requested(pi.cmdline,"torch",PLAT==&platform_dipper,0);
+ 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
+ 	int camera_requested = 0;
+ 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
+@@ -2864,9 +3116,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+ 		}
+ 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
+-		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
+-		    (c[9] == 0 || c[9] == ' ');
+-		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+ 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
+ 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+ 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
+@@ -2988,6 +3237,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 			ba->commandLine[n++] = *c;
+ 		}
+ 	}
++	/* a SoC whose virtual timer is not on the kernel's default PPI says so (the payload's own vtimer_intid= wins) */
++	int own_vtimer = 0;
++	for (const char *c = pi.cmdline; *c; c++) {
++		own_vtimer |= starts_with(c, "vtimer_intid=") && (c == pi.cmdline || c[-1] == ' ');
++	}
++	if (PLAT->vtimer_intid != 0 && !own_vtimer) {
++		char tail[] = "vtimer_intid=00 ";
++		tail[13] = (char)('0' + PLAT->vtimer_intid / 10);
++		tail[14] = (char)('0' + PLAT->vtimer_intid % 10);
++		for (const char *c = tail; *c && n < BOOT_LINE_LENGTH - 1; c++) {
++			ba->commandLine[n++] = *c;
++		}
++	}
+ 	if (wdt_armed) {
+ 		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+ 			ba->commandLine[n++] = *c;
+@@ -3344,6 +3606,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 		print("ufs: the kernel put its own list in %d times and took it out %d times\n",
+ 		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
+ 	}
++	if (block_enabled) {
++		/* what the kernel asked of the storage this run, and how long this core spent in ReadBlocks/WriteBlocks for it (EXP-0048, F-021) */
++		print("ufs: the kernel's requests: %d served, %d failed, %d bytes; %d ms in the firmware's block calls\n",
++		    block_shared.answer.served, block_shared.answer.failed, block_shared.answer.bytes,
++		    block_shared.answer.ticks * 1000 / READ_SYSREG(CNTFRQ_EL0));
++	}
+ 	if (block_write_requested) {
+ 		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+ 		    block_write_bytes, block_writes_refused);
+@@ -3788,8 +4056,17 @@ usb_poll_command(void)
+ 	if (USB == NULL) {
+ 		return;         /* this run was not started over USB */
+ 	}
+-	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
+-		usb_rx_queued = 1;
++	if (!usb_rx_queued && usb_connected) {
++		if (!EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
++			usb_rx_queued = 1;
++		} else {
++			/*
++			 * The cable was pulled and no state-change event has come (yet): the controller's own driver prints
++			 * "usbDevicesSend: failed to submit data transfer" on the screen for every attempt, and this loop
++			 * makes one on every pass. Treat the host as gone until the controller says it is back.
++			 */
++			usb_connected = 0;
++		}
+ 	}
+ 	USB->handle_event(&msg, &size, &data);
+ 	if (msg == UsbDeviceEventDeviceStateChange) {
+@@ -3917,6 +4194,241 @@ ramfb_phone_screen(void)
+ 	SCREEN.stride = PHONE_WIDTH * 4;
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/* Timer probe (EXP-0028): which interrupt does the EL1 virtual timer raise?   */
++/*                                                                          */
++/* The kernel hard-codes PPI 27 (INTID); Qualcomm parts up to SDM845 wire the  */
++/* timers to INTID 16-19 (stock DT of the Mi 8: virtual 19). This starts the   */
++/* virtual timer for 1 ms with interrupts masked on this core, and reads which */
++/* PPI of this core's redistributor goes pending. It writes no GIC register.   */
++
++static uint32_t
++mmio_r32(uint64_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++/*
++ * "idprobe" (EXP-0043, U-032): which of the 8 cores can run what the kernel needs? Each core is started
++ * by the firmware (PSCI CPU_ON, as for "bootcpu=N") at id_probe_entry, which reads the core's ID registers
++ * into its own line of id_probe_out[], marks it done and switches itself off. No kernel runs, nothing is
++ * written anywhere but into these lines. Registers (ARM ARM): MIDR_EL1, MPIDR_EL1, ID_AA64PFR0_EL1,
++ * ID_AA64MMFR0_EL1 (TGran16 [23:20]: 0 no 16 KB pages, 1 yes), ID_AA64MMFR1_EL1, ID_AA64ISAR0_EL1,
++ * ID_AA64ISAR1_EL1 (APA [7:4], API [11:8]: address authentication; GPA [27:24], GPI [31:28]: generic).
++ */
++struct id_probe_line {
++	volatile uint64_t done;         /* written last */
++	uint64_t el, midr, mpidr, pfr0, mmfr0, mmfr1, isar0, isar1;
++	uint64_t cycles, ticks;     /* PMCCNTR_EL0 and CNTVCT_EL0 over the same ~20 ms: the core's actual clock (EXP-0049) */
++} __attribute__((aligned(128)));
++static struct id_probe_line id_probe_out[8];
++void id_probe_entry(void);
++
++__asm__ (
++        ".text\n"
++        ".balign 64\n"
++        ".globl id_probe_entry\n"
++        "id_probe_entry:\n"                     /* x0 = this core's line; MMU and caches are off */
++        "  msr daifset, #0xf\n"
++        /* a register this core may not touch must not send it nowhere: other_cpu_fault switches the core off */
++        "  adrp x9, other_cpu_vectors\n"
++        "  add  x9, x9, :lo12:other_cpu_vectors\n"
++        "  msr vbar_el1, x9\n"
++        "  isb\n"
++        "  mrs x9, CurrentEL\n"
++        "  lsr x9, x9, #2\n"
++        "  str x9, [x0, #8]\n"
++        "  mrs x9, midr_el1\n"
++        "  str x9, [x0, #16]\n"
++        "  mrs x9, mpidr_el1\n"
++        "  str x9, [x0, #24]\n"
++        "  mrs x9, id_aa64pfr0_el1\n"
++        "  str x9, [x0, #32]\n"
++        "  mrs x9, id_aa64mmfr0_el1\n"
++        "  str x9, [x0, #40]\n"
++        "  mrs x9, id_aa64mmfr1_el1\n"
++        "  str x9, [x0, #48]\n"
++        "  mrs x9, id_aa64isar0_el1\n"
++        "  str x9, [x0, #56]\n"
++        "  mrs x9, id_aa64isar1_el1\n"
++        "  str x9, [x0, #64]\n"
++        /* the clock: count cycles (PMCCNTR_EL0: PMCR_EL0.E and .C, PMCNTENSET_EL0 bit 31) for 1/50 s of CNTVCT */
++        "  mov x9, #5\n"
++        "  msr pmcr_el0, x9\n"
++        "  mov x9, #1\n"
++        "  lsl x9, x9, #31\n"
++        "  msr pmcntenset_el0, x9\n"
++        "  isb\n"
++        "  mrs x12, cntfrq_el0\n"
++        "  mov x13, #50\n"
++        "  udiv x12, x12, x13\n"
++        "  mrs x10, cntvct_el0\n"
++        "  mrs x11, pmccntr_el0\n"
++        "  add x12, x12, x10\n"
++        "3: mrs x14, cntvct_el0\n"
++        "  cmp x14, x12\n"
++        "  b.lo 3b\n"
++        "  mrs x15, pmccntr_el0\n"
++        "  mrs x16, cntvct_el0\n"
++        "  sub x15, x15, x11\n"
++        "  sub x16, x16, x10\n"
++        "  str x15, [x0, #72]\n"
++        "  str x16, [x0, #80]\n"
++        "  dsb sy\n"
++        "  mov x9, #1\n"
++        "  str x9, [x0]\n"
++        "  dsb sy\n"
++        "  sev\n"
++        "  adrp x10, psci_by_hvc\n"
++        "  add  x10, x10, :lo12:psci_by_hvc\n"
++        "  ldr x9, [x10]\n"
++        "  mov x0, #0x0002\n"                   /* PSCI CPU_OFF: does not return */
++        "  movk x0, #0x8400, lsl #16\n"
++        "  cbnz x9, 2f\n"
++        "  smc #0\n"
++        "1: wfi\n"
++        "  b 1b\n"
++        "2: hvc #0\n"
++        "  b 1b\n"
++        );
++
++static void
++id_probe(void)
++{
++	uint64_t self = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF;
++
++	psci_by_hvc = PLAT->psci_hvc;
++	clean_dcache((uint64_t)(uintptr_t)&psci_by_hvc, (uint64_t)(uintptr_t)&psci_by_hvc + 8);
++	clean_dcache((uint64_t)(uintptr_t)&id_probe_entry, (uint64_t)(uintptr_t)&id_probe_entry + 0x200);
++	print("idprobe: core 0 is %x; the others are started one at a time\n", self);
++	/* this core last: its PMU access is the one that could go wrong on this core's own stack of handlers */
++	for (int k = 0; k < PLAT->cores && k < 8; k++) {
++		int core = (k + 1) % PLAT->cores;
++		uint64_t mpidr = (uint64_t)core << PLAT->core_shift;
++		struct id_probe_line *l = &id_probe_out[core];
++		int64_t status = 0;
++		uint64_t t;
++
++		if (mpidr == self) {
++			uint64_t m = READ_SYSREG(MPIDR_EL1);
++			__asm__ volatile ("mrs %0, id_aa64pfr0_el1" : "=r" (l->pfr0));
++			__asm__ volatile ("mrs %0, id_aa64mmfr0_el1" : "=r" (l->mmfr0));
++			__asm__ volatile ("mrs %0, id_aa64mmfr1_el1" : "=r" (l->mmfr1));
++			__asm__ volatile ("mrs %0, id_aa64isar0_el1" : "=r" (l->isar0));
++			__asm__ volatile ("mrs %0, id_aa64isar1_el1" : "=r" (l->isar1));
++			l->midr = READ_SYSREG(MIDR_EL1);
++			l->mpidr = m;
++			l->el = 1;
++			{
++				uint64_t c0, c1, t0, t1, want = READ_SYSREG(CNTFRQ_EL0) / 50;
++
++				__asm__ volatile ("msr pmcr_el0, %0\n msr pmcntenset_el0, %1\n isb" : : "r" (5ULL), "r" (1ULL << 31));
++				t0 = READ_SYSREG(CNTVCT_EL0);
++				__asm__ volatile ("mrs %0, pmccntr_el0" : "=r" (c0));
++				while (READ_SYSREG(CNTVCT_EL0) - t0 < want) {
++				}
++				__asm__ volatile ("mrs %0, pmccntr_el0" : "=r" (c1));
++				t1 = READ_SYSREG(CNTVCT_EL0);
++				l->cycles = c1 - c0;
++				l->ticks = t1 - t0;
++			}
++			l->done = 1;
++		} else {
++			memset(l, 0, sizeof(*l));
++			clean_dcache((uint64_t)(uintptr_t)l, (uint64_t)(uintptr_t)l + sizeof(*l));
++			status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&id_probe_entry, (uint64_t)(uintptr_t)l);
++			t = READ_SYSREG(CNTVCT_EL0);
++			while (status == 0 && seconds_since(t) < 3) {
++				flush_dcache((uint64_t)(uintptr_t)l, (uint64_t)(uintptr_t)l + sizeof(*l));
++				if (l->done) {
++					break;
++				}
++			}
++			flush_dcache((uint64_t)(uintptr_t)l, (uint64_t)(uintptr_t)l + sizeof(*l));
++		}
++		if (!l->done) {
++			print("idprobe: core %d (mpidr %x): firmware says %d, no answer\n", (uint64_t)core, mpidr, (uint64_t)status);
++			continue;
++		}
++		print("idprobe: core %d mpidr %x EL%d MIDR %x part %x\n", (uint64_t)core, l->mpidr & 0xFFFFFF, l->el, l->midr,
++		    (l->midr >> 4) & 0xFFF);
++		print("  clock: %d cycles in %d ticks of %d Hz = %d MHz\n", l->cycles, l->ticks, READ_SYSREG(CNTFRQ_EL0),
++		    l->ticks ? l->cycles * (READ_SYSREG(CNTFRQ_EL0) / 1000) / l->ticks / 1000 : 0);
++		print("  MMFR0 %x TGran16 %d TGran4 %d TGran64 %d | ISAR0 %x ISAR1 %x APA %d API %d GPA %d GPI %d | PFR0 %x\n",
++		    l->mmfr0, (l->mmfr0 >> 20) & 0xF, (l->mmfr0 >> 28) & 0xF, (l->mmfr0 >> 24) & 0xF, l->isar0, l->isar1,
++		    (l->isar1 >> 4) & 0xF, (l->isar1 >> 8) & 0xF, (l->isar1 >> 24) & 0xF, (l->isar1 >> 28) & 0xF, l->pfr0);
++	}
++	print("idprobe: done\n");
++}
++
++static uint64_t
++mmio_r64(uint64_t a)
++{
++	return *(volatile uint64_t *)a;
++}
++
++static void
++timer_probe(void)
++{
++	uint64_t mpidr = READ_SYSREG(MPIDR_EL1), freq = READ_SYSREG(CNTFRQ_EL0);
++	uint64_t aff = (mpidr & 0xFFFFFF) | (((mpidr >> 32) & 0xFF) << 24);
++	uint64_t rd = 0;
++
++	print("tprobe: mpidr %x cntfrq %d\n", mpidr, freq);
++	for (unsigned i = 0; i < 16; i++) {
++		uint64_t frame = PLAT->gic_redist + (uint64_t)i * 0x20000;
++		uint64_t typer = mmio_r64(frame + 0x08);
++
++		print("tprobe: gicr[%d] at %x typer %x\n", (uint64_t)i, frame, typer);
++		if ((typer >> 32) == aff) {
++			rd = frame;
++			break;
++		}
++		if (typer & 0x10) {
++			break;
++		}
++	}
++	if (rd == 0) {
++		print("tprobe: no redistributor frame for this core\n");
++		return;
++	}
++
++	uint64_t sgi = rd + 0x10000;
++	uint64_t daif, ctl0, ctl1, pend0, pend1, pend2, enabled, t;
++
++	print("tprobe: rd %x waker %x\n", rd, (uint64_t)mmio_r32(rd + 0x14));
++	print("tprobe: igroupr0 %x grpmodr0 %x isenabler0 %x icfgr1 %x\n", (uint64_t)mmio_r32(sgi + 0x80),
++	    (uint64_t)mmio_r32(sgi + 0xD00), (uint64_t)mmio_r32(sgi + 0x100), (uint64_t)mmio_r32(sgi + 0xC04));
++
++	__asm__ volatile ("mrs %0, daif" : "=r" (daif));
++	__asm__ volatile ("msr daifset, #3" ::: "memory");
++	__asm__ volatile ("msr cntv_ctl_el0, %0; isb" :: "r" (0ULL) : "memory");
++	ctl0 = READ_SYSREG(CNTV_CTL_EL0);
++	pend0 = mmio_r32(sgi + 0x200);
++	__asm__ volatile ("msr cntv_tval_el0, %0" :: "r" (freq / 1000) : "memory");
++	__asm__ volatile ("msr cntv_ctl_el0, %0; isb" :: "r" (1ULL) : "memory");
++	t = READ_SYSREG(CNTVCT_EL0);
++	while (READ_SYSREG(CNTVCT_EL0) - t < freq / 200) {
++	}
++	ctl1 = READ_SYSREG(CNTV_CTL_EL0);
++	pend1 = mmio_r32(sgi + 0x200);
++	enabled = mmio_r32(sgi + 0x100);
++	__asm__ volatile ("msr cntv_ctl_el0, %0; isb" :: "r" (0ULL) : "memory");
++	pend2 = mmio_r32(sgi + 0x200);
++	__asm__ volatile ("msr daif, %0" :: "r" (daif) : "memory");
++
++	print("tprobe: CNTV_CTL before %x, after 5 ms %x (bit 2 = ISTATUS: the timer fired)\n", ctl0, ctl1);
++	print("tprobe: ISPENDR0 before %x, with timer %x, timer off %x; ISENABLER0 %x\n", pend0, pend1, pend2, enabled);
++	for (unsigned n = 16; n < 32; n++) {
++		if (((pend1 & ~pend0) >> n) & 1) {
++			print("tprobe: INTID %d went pending because of the virtual timer\n", (uint64_t)n);
++		}
++	}
++	if ((pend1 & ~pend0) == 0) {
++		print("tprobe: no PPI went pending (ISTATUS says %d)\n", (ctl1 >> 2) & 1);
++	}
++}
++
+ efi_status EFIAPI
+ efi_main(efi_handle image, efi_system_table *st)
+ {
+@@ -3944,24 +4456,82 @@ efi_main(efi_handle image, efi_system_table *st)
+ 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
+ 			if (platforms[i]->fb_base == SCREEN.base)
+ 				PLAT = platforms[i];
++		if (PLAT == &platform_qemu_virt) {
++			uint64_t midr = READ_SYSREG(MIDR_EL1);
++			for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
++				for (int j = 0; j < 2; j++)
++					if (platforms[i]->midr_part[j] && (midr >> 24 & 0xFF) == 0x51 &&
++					    (midr >> 4 & 0xFFF) == platforms[i]->midr_part[j])
++						PLAT = platforms[i];
++		}
+ 		if (PLAT == &platform_qemu_virt)
+ 			ramfb_phone_screen();
+ 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+ 	}
++	log_write_disabled = PLAT->no_log_write;
+ 	print("platform %s\n", PLAT->name);
+ 
+ 	install_exception_hook();
+ 	wdt_arm();
+ 
+ 	int have_payload = parse_payload(&pi, 0);
++	if (have_payload && pi.timer_probe) {
++		timer_probe();
++		for (uint64_t n = 0;; n++) {
++			uint64_t t = READ_SYSREG(CNTVCT_EL0);
++			print("tprobe done, alive %d s\n", n * 5);
++			while (seconds_since(t) < 5) {
++			}
++		}
++	}
++	if (have_payload && pi.id_probe) {
++		id_probe();
++	}
+ 	if (have_payload && pi.usb_mode && usb_start()) {
+ 		flush_log();
+ 		usb_command_loop();
+ 	}
+ 
++	if (!have_payload && PLAT->no_log_write) {
++		/*
++		 * Display bring-up on a phone with nothing to run: stay here so the text above can be read,
++		 * and show that the loader is alive. A long press of the power key resets the phone.
++		 */
++		for (uint64_t n = 0;; n++) {
++			uint64_t t = READ_SYSREG(CNTVCT_EL0);
++			print("alive %d s\n", n * 5);
++			while (seconds_since(t) < 5) {
++			}
++		}
++	}
++
++	/*
++	 * No menu: the flag in darwin decides. iOS is a one-shot request, cleared
++	 * here, so the next cold boot (a reboot from iOS) returns to Android.
++	 */
++	if (have_payload && !pi.usb_mode) {
++		struct boot_flag f;
++
++		if (boot_flag_read(&f) && f.state == FLAG_STATE_IOS && flashboot_ok(&f)) {
++			print("dualboot: iOS (flashboot %x bytes)\n", (uint64_t)f.fb_bytes);
++			boot_flag_write_state(0);
++		} else {
++			android_handoff();
++		}
++	}
++
+ 	/* One-shot mode: run the kernel that came with the image, then reset. */
+ 	if (have_payload) {
+ 		run_kernel(0, 0);
++		if (PLAT->no_log_write) {
++			/*
++			 * Nothing persists the log here, and a reset now would take the screen with it (EXP-0029:
++			 * the phone restarted a moment after a panic). Stay so that it can be read.
++			 */
++			print("\n-- held: long-press the power key to reset the phone --\n");
++			for (;;) {
++			}
++		}
+ 	}
+ 	reboot();
+ 	return 0;
