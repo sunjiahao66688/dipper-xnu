@@ -1,0 +1,17 @@
+{
+  "device": "dipper",
+  "inputs": {
+    "original_boot": "1aaf3c1ea2d507e6b29424c7ece6472b650445535f0317a01b6b639c3bcbf48f",
+    "firmware": "7a7695218a1f6f1386d9ac62970242cdd29831e7ca4f6cfa571e30be6488a64d",
+    "shim": "6dc8d3d522f1ed69032007d547dd6377155da1fd3fe2da4d3800dce1e6dbcbfd",
+    "kernelpatcher": "a95376c8b2eb248cee3f91bb84250053f842177d96ac5cbec96af22a85b1e2e7",
+    "payload": "d01fab970f261732ae4caa9723e3bec2c141c0b1b0a7a377d073f55cd3103f72"
+  },
+  "candidate_sha256": "7f2c7687be7f066564257a69755e9f0d2a08a0820ba17351a3c719d98ff58803",
+  "bytes": 66043904,
+  "original_ramdisk_sha256": "3ccd54f3abeb2f77bfed91bd03f4a37d256c6755977618851b781e1c6d43b9f2",
+  "original_dtb_sha256": "8a2846014a18a332a8ea648d0e3acf8b7fdb5fc0506b33d80141df28d723d658",
+  "reserved_decompressed_bytes": 76399856,
+  "device_test": "NOT RUN",
+  "flashed": false
+}
